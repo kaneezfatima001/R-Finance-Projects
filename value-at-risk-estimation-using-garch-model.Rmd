@@ -1,0 +1,342 @@
+---
+title: "Value at Risk estimation using GARCH model"
+author: "Ionas Kelepouris & Dimos Kelepouris"
+date: "July 6, 2019"
+output: 
+        html_document:
+                fig_height: 7
+                fig_width: 10
+                highlight: tango
+                toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE , warning = FALSE , error = FALSE , message = FALSE)
+```
+
+
+## Introduction
+
+The purpose of this analysis is to construct a process to properly estimate Value at Risk given time-varying volatility. Value at Risk is widely used to measure Market Risk for financial institutions. Our time series data consists of stock returns for 1258 days. With the aim of explaining a small proportion of the variance of daily returns, we perform Box-Jenkins methodology to fit an Autoregressive Integrated Moving Average (ARIMA) model and we test the underlined assumptions. Later on, we check for returns' normality, as we search for alternatives, best fitted distributional forms. We estimate the conditional variance of the residuals with Generalized Autoregressive Heteroscedasticity (GARCH) method, comparing it with delta-normal approach. Eventually, we perform 1-step ahead VaR forecast and we run backtesting in order to check whether our model is adequate.  
+
+
+## Data & Libraries
+
+For the purpose of the modelling process, we collected 5 years (Feb 2013 - Feb 2018) of Citigroup Inc. stock at a daily frequency (a total of 1259 observations).
+
+```{r data}
+# Load libraries
+library(tidyverse)
+library(ggthemes)
+library(forecast)
+library(tseries)
+library(gridExtra)
+library(rugarch)
+
+# Load data
+stocks = read.csv('../input/all_stocks_5yr.csv' , header = T)
+stocks = stocks %>% select(date , close , Name)
+
+# One column for each stock
+stocks = stocks %>% spread(key = Name , value = close)
+
+qplot(x = 1:1259 , y = stocks$C , geom = 'line') + geom_line(color = 'darkblue') + 
+    labs(x = '' , y = 'Price' , title = "Citigroup Inc.") + geom_hline(yintercept = mean(stocks$C) , color = 'red')
+```
+
+
+<span style="color:red">Red</span> line denotes the average closing price for this particular timeframe.
+
+Non-stationary processes have means, variances and covariances that change over time. Using non-stationary time series data leads to unreliable forecasting. A stationary process is mean-reverting, i.e, it fluctuates around a constant mean with constant variance. In our case, stationarity refers to weak stationarity where the stationary time series satisfies three conditions:
+
+* $E(y_{t}) = \mu$
+* $E(y_{t}^2) = \sigma^2 < \infty$
+* $Cov(y_{1},y_{1+s}) = Cov(y_{2},y_{2+s}) = \cdots = Cov(y_{T},y_{T+s}) = \gamma_{s}$
+
+
+In order to resolve this issue, we mostly use differencing. The 1-order differencing can be described as
+
+<center>$\Delta y_{t} = y_{t} - y_{t-1}$</center>
+
+For the stationarity transformation, we prefer to calculate the simple daily returns, expressed as follows
+
+<center>$r_{t} = \frac{price_{t} - price_{t-1}}{price_{t-1}}$</center>
+
+```{r returns}
+rets = diff(stocks$C) / stocks$C[-length(stocks$C)]
+
+p1 = qplot(x = 1:length(rets) , y = rets , geom = 'line') + geom_line(color = 'darkblue') + 
+    geom_hline(yintercept = mean(rets) , color = 'red' , size = 1) + 
+    labs(x = '' , y = 'Daily Returns')
+
+p2 = qplot(rets , geom = 'density') + coord_flip() + geom_vline(xintercept = mean(rets) , color = 'red' , size = 1) +
+    geom_density(fill = 'lightblue' , alpha = 0.4) + labs(x = '')
+
+grid.arrange(p1 , p2 , ncol = 2)
+```
+
+To verify the stationarity of the returns, we utilize the Augmented Dickey-Fuller test where null hypothesis indicates non-stationary time series.
+
+```{r adf_test}
+adf.test(rets)
+```
+
+Small P-value (<0.01) suggests there is sufficient evidence to reject the null hypothesis, therefore time series are considered stationary.
+
+
+## Box-Jenkins Methodology
+
+For time series analysis, Box-Jenkins approach applies ARIMA models to find the best fit of a time series model that represent the stochastic process which generate time series. This method uses a three stage modelling approach: a) **identification**, b) **estimation**, c) **diagnostic checking**.
+
+### Identification
+
+To use the Box-Jenkins methodology we have to make sure the time series are stationary. In our case, we use the returns of the stock that we have already checked for stationarity in the previous part. Moreover, based on the Autocorelation Function (ACF) and Partial Autocorrelation Function (PACF) it is possible to determine p, d and q order of the ARIMA model. Another way to identify the model is the Akaike Information Criterion (AICc). AIC estimates the quality of each model relative to each of the other models.
+
+<center>$AIC = ln\frac{\sum\hat{u}^2}{T} + \frac{2k}{T}$</center>
+
+where 
+
+- $\sum\hat{u}^2$ = Sum of Squared Residuals
+- $T$ = number of observations
+- $k$ = number of model parameters (p + q + 1)
+
+It is obvious that when extra lag parameters are added to the model Sum Squared of Residuals decreases but overfitting problems may occur. AIC deals with both the risk of overfitting and underfitting. The model with the lowest AIC will be selected.
+
+```{r arima_best_fit}
+model.arima = auto.arima(rets , max.order = c(3 , 0 ,3) , stationary = TRUE , trace = T , ic = 'aicc')
+```
+
+One can observe with the process above we computed AIC scores for various ARIMA models and we infer that the appropriate model is a **2-order Autoregressive (AR(2))**.
+
+### Estimation
+
+To estimate the coefficients of the parameters we use Maximum Likelihood. Using ARIMA(2, 0, 0) as selected model, the results is as follows:
+
+```{r arima200}
+model.arima
+```
+
+Therefore the process can be described as:
+
+<center>$r_{t} = 0.0437*r_{t-1} - 0.0542*r_{t-2} + \epsilon_{t}$ where $\epsilon_{t}$ is White Noise</center>
+
+
+### Diagnostics Checking
+
+The procedure includes observing residual plot and its ACF & PACF diagram, and check Ljung-Box test result. If ACF & PACF of the model residuals show no significant lags, the selected model is appropriate.
+
+```{r resid_diagnostics}
+model.arima$residuals %>% ggtsdisplay(plot.type = 'hist' , lag.max = 14)
+```
+
+Both ACF and PACF plots are similar and autocorrelations seem to be equal to zero. The lower right corner plot represents the histogram of the residuals compared to a normal distribution N(0 , $\sigma^2$).
+
+To further test the hypothesis that the residual are not correlated, we perform Ljung-Box test.
+
+<center>$$Q_{LB} = T(T+2)\sum_{s=1}^{m} \frac{\hat\rho_{s}^{2}}{T-s}$$</center>
+
+The $Q_{LB}$ statistic follows asymmetrically a $X^{2}$ distribution with m-p-q degrees of freedom. The null hypothesis refers to $H_{0}: \rho_{1}=\rho_{2}=\dots=\rho_{m}=0$
+
+```{r ljung_box}
+ar.res = model.arima$residuals
+Box.test(model.arima$residuals , lag = 14 , fitdf = 2 , type = 'Ljung-Box')
+```
+
+We cannot reject the null hypothesis, therefore the process of the residuals behave like white noise so there is no indication of pattern that might be modeled.
+
+
+## GARCH Implementation
+
+Although ACF & PACF of residuals have no significant lags, the time series plot of residuals shows some cluster volatility. It is important to remember that ARIMA is a method to linearly model the data and the forecast width remains constant because the model does not reflect recent changes or incorporate new information. In order to model volatility we use the Autoregressive Conditional Heteroscedasticity (ARCH) model. ARCH is a statistical model for time series data that describes the variance of the current error term as a function of the actual sizes of the previous time periods' error terms.
+
+We assume that the time series of interest, $r_{t}$, is decomposed into two parts, the predictable and unpredictable component, $r_{t} = E(r_{t}|I_{t-1}) + \epsilon_{t}$, where $I_{t-1}$ is the information set at time $t-1$ and $E(r_{t}|I_{t-1}) = 0.0437*r_{t-1} - 0.0542*r_{t-2}$ and $\epsilon_t$ is the unpredictable part, or innovation process.
+
+The unpredictable component, can be expressed as a GARCH process in the following form:
+
+$$\epsilon_{t} = z_{t}*\sigma_{t}$$
+
+where $z_{t}$ is a sequence of independently and identically distributed random variables with zero mean and variance equal to 1. The conditional variance of $\epsilon_{t}$ is $\sigma_{t}$, a time-varying function of the information set at time $t-1$.
+
+Next step is to define the the second part of the error term decomposition which is the conditional variance, $\sigma_{t}$. For such a task, we can use a GARCH(1 , 1) model, expressed as:
+
+$$\sigma_{t}^{2} = \omega + a_{1}*\epsilon_{t-1}^{2} + \beta_{1}*\sigma_{t-1}^{2}$$
+
+The GARCH process is valid when the squared residuals are correlated. ACF and PACF plots clearly indicate significant correlation.
+
+```{r acf_sq_res}
+tsdisplay(ar.res^2 , main = 'Squared Residuals')
+```
+
+Another way to test the Heteroscedasticity of the squared residuals is to perform significance testing on $a_{1}$ and $\beta_{1}$ parameters.
+
+
+```{r rugarch}
+# Model specification
+model.spec = ugarchspec(variance.model = list(model = 'sGARCH' , garchOrder = c(1 , 1)) , 
+                        mean.model = list(armaOrder = c(0 , 0)))
+
+model.fit = ugarchfit(spec = model.spec , data = ar.res , solver = 'solnp')
+
+options(scipen = 999)
+model.fit@fit$matcoef
+```
+
+Both $a_{1}$ and $\beta_{1}$ are significantly different from zero, therefore it is reasonable to assume time-varying volatility of the residuals.
+
+With successive replacement of the $\sigma_{t-1}^2$ term, the GARCH equation can be written as:
+
+$$\sigma_{t}^2 = \frac{\omega}{1-\beta_1}+a_{1}*\sum_{i=1}^{\infty} \beta_{1}^{i-1}*\epsilon_{t-i}^{2}$$
+
+When we replace with the coefficient estimates given by optimization we get the following equation:
+
+$$\sigma_{t}^2 = 0.000087 + 0.108*(\epsilon_{t-1}^{2} + 0.825*\epsilon_{t-2}^2 + 0.680*\epsilon_{t-3}^2 + 0.561*\epsilon_{t-4}^{2} + \dots)$$
+
+Given that $0<\beta_{1}<1$, as lag increases the effect of the squared residual decreases.
+
+## Value at Risk
+
+Value at Risk (VaR) is a statistical measure of downside risk based on current position. It estimates how much a set of investments might lose given normal market conditions in a set time period. A VaR statistic has three components: a) **time period**, b) **confidence level**, c) **loss ammount (or loss percentage)**. For 95% confidence level, we can say that the worst daily loss will not exceed VaR estimation. If we use historical data, we can estimate VaR by taking the 5% quantile value. For our data this estimation is:
+
+```{r hist_var}
+quantile(rets , 0.05)
+qplot(rets , geom = 'histogram') + geom_histogram(fill = 'lightblue' , bins = 30) +
+    geom_histogram(aes(rets[rets < quantile(rets , 0.05)]) , fill = 'red' , bins = 30) +
+    labs(x = 'Daily Returns')
+```
+
+Red bars refer to returns lower than 5% quantile.
+
+## Distributional Properties
+
+To estimate VaR, we need to properly define the corresponding quantile of the assumed distribution. For normal distribution, the quantile corresponding to a = 5% is -1.645. Empirical evidence suggest the assumption of normality often produces weak results. Jarque-Bera test can test the hypothesis that stock returns follow a normal distribution.
+
+$$JB = \frac{n-k+1}{6}*(S^{2} + \frac{1}{4}*(C-3)^{2})$$
+
+where $S$ is skewness and $C$ is kurtosis. A normal distributed sample would return a JB score of zero. The low p-value indicates stock returns are not normally distributed.
+
+```{r jb_test}
+jarque.bera.test(rets)
+```
+
+```{r dist_plot}
+p2_1 = qplot(rets , geom = 'density') + geom_density(fill = 'blue' , alpha = 0.4) + 
+    geom_density(aes(rnorm(200000 , 0 , sd(rets))) , fill = 'red' , alpha = 0.25) + 
+    labs(x = '')
+
+p2_2 = qplot(rets , geom = 'density') + geom_density(fill = 'blue' , alpha = 0.4) + 
+    geom_density(aes(rnorm(200000 , 0 , sd(rets))) , fill = 'red' , alpha = 0.25) + 
+    coord_cartesian(xlim = c(-0.07 , -0.02) , ylim = c(0 , 10)) + 
+    geom_vline(xintercept = c(qnorm(p = c(0.01 , 0.05) , mean = mean(rets) , sd = sd(rets))) , 
+               color = c('darkgreen' , 'green') , size = 1) + labs(x = 'Daily Returns')
+
+grid.arrange(p2_1 , p2_2 , ncol = 1)
+```
+
+On the figure above, Density plots are shown for stock returns (*blue*) and normal distributed data (*red*). Vertical lines of the lower plot represent the normal corresponding quantile for a = 0.05 (*light green*) and a = 0.01 (*dark green*). Lower plot indicates that for 95% significance, normal distribution usage may overestimate the value at risk. However, for 99% significance level, a normal distribution would underestimate the risk.
+
+
+**Student's t-distribution**
+
+In order to model more adequately the thickness of tails, we can use other distributional assumptions for stock returns. The t-distribution is symmetric and bell-shaped, like the normal distribution, but has heavier tails, meaning that it is more prone to producing values that fall far from its mean. We use the *fitdist* function from *rugarch package* to get the fitting parameters of t-distribution.
+
+```{r fitdist}
+fitdist(distribution = 'std' , x = rets)$pars
+cat("For a = 0.05 the quantile value of normal distribution is: " , 
+    qnorm(p = 0.05) , "\n" ,
+     "For a = 0.05 the quantile value of t-distribution is: " ,
+    qdist(distribution = 'std' , shape = 3.7545967917 , p = 0.05) , "\n" , "\n" , 
+    'For a = 0.01 the quantile value of normal distribution is: ' , 
+    qnorm(p = 0.01) , "\n" , 
+    "For a = 0.01 the quantile value of t-distribution is: " , 
+    qdist(distribution = 'std' , shape = 3.7545967917 , p = 0.01) , sep = "")
+```
+
+As we observe, quantiles for 95% significance level indicate that normal distribution overestimates risk but for 99% fails to capture the existence of outliers, therefore underestimation of risk occurs. 
+
+
+## Garch VaR vs Delta-normal approach
+
+**Delta-normal** approach assumes that all stock returns are normally distributed. This method consists of going back in time and computing the variance of returns. Value at Risk can be defined as:
+
+$$VaR(a)=\mu + \sigma*N^{-1}(a)$$
+
+where $\mu$ is the mean stock return, $\sigma$ is the standard deviation of returns, $a$ is the selected confidence level and $N^{-1}$ is the inverse PDF function, generating the corresponding quantile of a normal distribution given $a$.
+
+The results of such a simple model is often disapointing and are rarely used in practice today. The assumption of normality and constant daily variance is usually wrong and that is the case for our data as well.
+
+Previously we observed that returns exhibit time-varying volatility. Hence for the estimation of VaR we use the conditional variance given by GARCH(1,1) model. For the underlined asset's distribution properties we use the student's t-distribution. For this method Value at Risk is expressed as:
+
+$$VaR(a)=\mu + \hat{\sigma}_{t|t-1}*F^{-1}(a)$$
+
+where $\hat{\sigma}_{t|t-1}$ is the conditional standard deviation given the information at $t-1$ and $F^{-1}$ is the inverse PDF function of t-distribution.
+
+```{r comparison_plot}
+qplot(y = rets , x = 1:1258 , geom = 'point') + geom_point(colour = 'lightgrey' , size = 2) + 
+    geom_line(aes(y = model.fit@fit$sigma*(-1.485151) , x = 1:1258) , colour = 'red') +
+    geom_hline(yintercept = sd(rets)*qnorm(0.05) , colour = 'darkgreen' , size = 1.2) + theme_light() + 
+    labs(x = '' , y = 'Daily Returns' , title = 'Value at Risk Comparison')
+```
+
+<span style="color:red">Red</span> line denotes VaR produced by GARCH model and <span style="color:darkgreen">green</span> line refers to delta-normal VaR.
+
+## VaR forecasting
+
+The *ugarchroll* method allows to perform a rolling estimation and forecasting of a model/dataset
+combination. It returns the distributional forecast parameters necessary to calculate any required measure on the forecasted density. We set the last 500 observations as test set and we perform a rolling moving 1-step ahead forecast of the conditional standard deviation, $\hat{\sigma}_{t+1|t}$. We re-estimate GARCH parameters every 50 observations.
+
+```{r garch}
+model.roll = ugarchroll(spec = model.spec , data = rets , n.start = 758 , refit.every = 50 ,
+                        refit.window = 'moving')
+
+# Test set 500 observations
+VaR95_td = mean(rets) + model.roll@forecast$density[,'Sigma']*qdist(distribution='std', shape=3.7545967917, p=0.05)
+```
+
+
+## Backtesting
+
+Let $N = \sum_{t=1}^{T} I_{t}$ be the number of days over a T period that stock returns was lower than the
+VaR estimate, where $I_{t}$ is **1** if $y_{t+1} < VaR_{t+1|t}$ and **0** if $y_{t+1} \ge VaR_{t+1|t}$. Hence, N is the observed number of exceptions in the sample. As argued in Kupiec (1995), the failure number follows a binomial distribution, B(T, p).
+
+```{r binom_plot}
+p = c()
+p[1] = pbinom(q = 0 , size = 500 , prob = 0.05)
+for(i in 1:50){
+    p[i] = (pbinom(q = (i-1) , size = 500 , prob = 0.05) - pbinom(q = (i-2) , size = 500 , prob = 0.05))
+}
+qplot(y = p , x = 1:50 , geom = 'line') + scale_x_continuous(breaks = seq(0 , 50 , 2)) + 
+    annotate('segment' , x = c(16 , 35) , xend = c(16 , 35) , y = c(0 , 0) , yend = p[c(16 , 35)] , color = 'red' , 
+             size = 1) + labs(y = 'Probability' , x = 'Number of Exceptions') + theme_light()
+```
+
+The plot above represent the distribution of probabilities for exceptions given by the binomial distribution. The expected number is 25 (=500obs. x 5%). Two red lines denote the 95% confidence level, the lower being **16** and the upper **35**. Therefore, when we check the exceptions on the test set, we expect a number between 16 and 35 to state that GARCH model as successfully predictive.
+
+
+```{r backtest}
+qplot(y = VaR95_td , x = 1:500 , geom = 'line') +
+    geom_point(aes(x = 1:500 , y = rets[759:1258] , color = as.factor(rets[759:1258] < VaR95_td)) , size = 2) + scale_color_manual(values = c('gray' , 'red')) + 
+    labs(y = 'Daily Returns' , x = 'Test set Observation') + theme_light() + 
+    theme(legend.position = 'none')
+```
+
+Black line represent the daily forecasted VaR given by the GARCH model and red points refer to returns lower than VaR. Final step is to count the number of exceptions and compare it with the one generated with delta-normal approach.
+
+```{r no_exceptions}
+cat('Number of exceptions with delta-normal approach: ' , (sum(rets[759:1258] < (mean(rets) + qnorm(p = 0.05)*sd(rets[1:758])))) , '\n' , 'Number of exceptions with GARCH approach: ' , (sum(rets[759:1258] < VaR95_td)) , sep = '')
+```
+
+As we stated earlier, we expected that delta-normal approach would overestimate risk. When backtesting, only 14 times returns were lower than VaR falling outside the 95% significance level (<16). On the other hand, GARCH approach (23 exceptions) seems to be an effective predictive tool in this particular case.
+
+
+## References
+
+**Angelidis T., Benos A. and Degiannakis S. (December 2003)**. The Use of GARCH Models in VaR Estimation.
+
+**Ghalanos A. (August 2017)**. Introduction to the rugarch package (Version 1.3-8).
+
+**Montgomery D., Jennings C. and Kulahci M. (2015)**. Introduction to Time Series Analysis and Forecasting (Second Edition). New Jersey: Wiley.
+
+
+
+
+
